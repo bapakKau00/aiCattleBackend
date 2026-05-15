@@ -1,0 +1,14 @@
+flask==3.0.3
+werkzeug==3.0.3
+numpy==1.26.4
+opencv-contrib-python-headless==4.8.1.78
+torch==2.3.0
+torchvision==0.18.0
+ultralytics==8.2.0
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+inference-sdk
+joblib==1.4.2
+scikit-learn==1.5.0
+scipy==1.13.0
+Pillow==10.4.0
+requests==2.32.3

@@ -369,6 +369,49 @@ def predict():
             "trace":  traceback.format_exc()
         }), 500
 
+# ── Route 2: Firebase Storage URLs ───────────────────────────────────────────
+@app.route('/predict_url', methods=['POST'])
+def predict_url():
+    """
+    Send Firebase Storage download URLs as JSON.
+    Body: { "color_url": "...", "depth_url": "...", "metadata_url": "..." }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Send JSON body with color_url, depth_url, metadata_url"}), 400
+ 
+        color_url    = data.get('color_url')
+        depth_url    = data.get('depth_url')
+        metadata_url = data.get('metadata_url')
+ 
+        if not all([color_url, depth_url, metadata_url]):
+            return jsonify({"error": "Missing color_url, depth_url or metadata_url"}), 400
+ 
+        print(f"Downloading files from Firebase...")
+ 
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rgb_path   = os.path.join(tmpdir, 'color.jpg')
+            depth_path = os.path.join(tmpdir, 'depth.npy')
+            meta_path  = os.path.join(tmpdir, 'metadata.json')
+ 
+            # Download all 3 files
+            download_url(color_url,    rgb_path)
+            print(f"✅ color.jpg downloaded")
+            download_url(depth_url,    depth_path)
+            print(f"✅ depth.npy downloaded")
+            download_url(metadata_url, meta_path)
+            print(f"✅ metadata.json downloaded")
+ 
+            result = run_pipeline(rgb_path, depth_path, meta_path)
+ 
+        return jsonify(result)
+ 
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"status": "error", "error": str(e),
+                        "trace": traceback.format_exc()}), 500
+
 
 if __name__ == '__main__':
     print("🐄 Cattle Weight API starting...")

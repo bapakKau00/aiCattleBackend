@@ -1,15 +1,12 @@
 """
 Cattle Weight Estimation API
 =============================
-POST /predict
-  - color.jpg   (RGB image)
-  - depth.npy   (depth map)
-  - metadata.json
-
-Returns JSON with weight estimate and measurements.
+POST /predict      — upload files directly (multipart/form-data)
+POST /predict_url  — send Firebase Storage URLs (application/json)
+GET  /health       — health check
 
 Run:
-  pip install flask ultralytics segment-anything inference-sdk joblib scikit-learn plotly
+  pip install -r requirements.txt
   python app.py
 """
 
@@ -17,17 +14,17 @@ import os, json, tempfile, traceback
 import numpy as np
 import cv2
 import torch
+import requests as http_requests
 from flask import Flask, request, jsonify
-from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
 # ── Lazy-loaded models ────────────────────────────────────────────────────────
-_yolo_model  = None
+_yolo_model    = None
 _sam_predictor = None
-_rf_model    = None
-_rf_scaler   = None
+_rf_model      = None
+_rf_scaler     = None
 
 def get_yolo():
     global _yolo_model
@@ -43,12 +40,13 @@ def get_sam():
         from segment_anything import sam_model_registry, SamPredictor
         ckpt = 'sam_vit_b_01ec64.pth'
         if not os.path.exists(ckpt):
-            print("Downloading SAM...")
+            print("Downloading SAM checkpoint...")
             urllib.request.urlretrieve(
                 'https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth',
                 ckpt
             )
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Loading SAM on {device}...")
         sam = sam_model_registry['vit_b'](checkpoint=ckpt)
         sam.to(device)
         _sam_predictor = SamPredictor(sam)
@@ -63,7 +61,7 @@ def get_rf():
     return _rf_model, _rf_scaler
 
 
-# ── Pipeline functions ────────────────────────────────────────────────────────
+# ── Helper functions ──────────────────────────────────────────────────────────
 
 def snap_to_pointcloud(u, v, conf, pts_3d, fx, fy, ppx, ppy,
                         conf_thresh=0.3, search_k=50,
@@ -76,13 +74,13 @@ def snap_to_pointcloud(u, v, conf, pts_3d, fx, fy, ppx, ppy,
         working = pts_3d[mask]
         if len(working) < 3:
             return None
-    z_vals      = working[:, 2]
-    u_proj      = working[:, 0] * fx / z_vals + ppx
-    v_proj      = working[:, 1] * fy / z_vals + ppy
-    dists       = np.sqrt((u_proj - u)**2 + (v_proj - v)**2)
-    k           = min(search_k, len(dists) - 1)
-    nearest     = np.argpartition(dists, k)[:k]
-    best        = nearest[np.argmin(dists[nearest])]
+    z_vals  = working[:, 2]
+    u_proj  = working[:, 0] * fx / z_vals + ppx
+    v_proj  = working[:, 1] * fy / z_vals + ppy
+    dists   = np.sqrt((u_proj - u)**2 + (v_proj - v)**2)
+    k       = min(search_k, len(dists) - 1)
+    nearest = np.argpartition(dists, k)[:k]
+    best    = nearest[np.argmin(dists[nearest])]
     return working[best]
 
 def find_by_class_id(keypoints, target_id):
@@ -98,22 +96,33 @@ def measure_3d(idx_a, idx_b, kps_3d):
         return float(np.linalg.norm(pt_a - pt_b))
     return None
 
+def download_url(url, dest_path):
+    """Download file from URL and save to dest_path."""
+    r = http_requests.get(url, timeout=60)
+    r.raise_for_status()
+    with open(dest_path, 'wb') as f:
+        f.write(r.content)
+
+
+# ── Core pipeline ─────────────────────────────────────────────────────────────
+
 def run_pipeline(rgb_path, depth_path, meta_path):
-    # ── Load files ────────────────────────────────────────────────────────────
+
+    # ── Load ──────────────────────────────────────────────────────────────────
     rgb_image = cv2.cvtColor(cv2.imread(rgb_path), cv2.COLOR_BGR2RGB)
     raw_depth = np.load(depth_path, allow_pickle=False).astype(np.float32)
     with open(meta_path) as f:
         meta = json.load(f)
 
     h, w = rgb_image.shape[:2]
+    print(f"RGB: {w}×{h}  Depth: {raw_depth.shape}  Device: {meta.get('deviceModel','?')}")
 
-    # ── Resize for AI ─────────────────────────────────────────────────────────
+    # ── YOLO detection ────────────────────────────────────────────────────────
     AI_W, AI_H = 1024, 768
     rgb_small  = cv2.resize(rgb_image, (AI_W, AI_H))
     scale_bx   = w / AI_W
     scale_by   = h / AI_H
 
-    # ── YOLO detection ────────────────────────────────────────────────────────
     yolo    = get_yolo()
     results = yolo(rgb_small)
     bbox    = None
@@ -125,9 +134,12 @@ def run_pipeline(rgb_path, depth_path, meta_path):
                 break
     if bbox is None:
         bbox = np.array([0, 0, w, h], dtype=np.float32)
+        print("⚠️  No cattle detected — using full image")
+    else:
+        print(f"✅ Cattle detected")
 
     # ── SAM segmentation ─────────────────────────────────────────────────────
-    predictor = get_sam()
+    predictor  = get_sam()
     predictor.set_image(rgb_small)
     bbox_small = np.array([
         bbox[0]/scale_bx, bbox[1]/scale_by,
@@ -136,7 +148,7 @@ def run_pipeline(rgb_path, depth_path, meta_path):
     masks, scores, _ = predictor.predict(
         box=bbox_small[None, :], multimask_output=True
     )
-    best_idx = 0
+    best_idx   = 0
     best_score = 0
     for i, (mask, score) in enumerate(zip(masks, scores)):
         cov = np.sum(mask) / mask.size * 100
@@ -147,6 +159,7 @@ def run_pipeline(rgb_path, depth_path, meta_path):
         masks[best_idx].astype(np.uint8), (w, h),
         interpolation=cv2.INTER_NEAREST
     )
+    print(f"✅ SAM mask: coverage={np.sum(cow_mask)/cow_mask.size*100:.1f}%")
 
     # ── Depth refinement ─────────────────────────────────────────────────────
     depth_unit = meta.get('depthUnit', 'mm')
@@ -165,8 +178,10 @@ def run_pipeline(rgb_path, depth_path, meta_path):
         refined   = cv2.ximgproc.jointBilateralFilter(
             joint=rgb_bgr_f, src=depth_up, d=15, sigmaColor=50, sigmaSpace=50
         )
+        print("✅ Joint bilateral filter applied")
     except Exception:
         refined = depth_up.copy()
+        print("⚡ Bilateral filter skipped")
 
     refined[cow_mask == 0] = 0
 
@@ -179,21 +194,21 @@ def run_pipeline(rgb_path, depth_path, meta_path):
     fy  = meta['fy']  * scale_y
     ppx = meta['ppx'] * scale_x
     ppy = meta['ppy'] * scale_y
+    print(f"Intrinsics scaled: fx={fx:.1f} fy={fy:.1f} ppx={ppx:.1f} ppy={ppy:.1f}")
 
     # ── Point cloud ───────────────────────────────────────────────────────────
     depth_m    = refined / 1000.0
     valid      = (depth_m > 0) & (cow_mask > 0)
     rows, cols = np.where(valid)
-    Z = depth_m[rows, cols]
-    X = (cols - ppx) * Z / fx
-    Y = (rows - ppy) * Z / fy
+    Z   = depth_m[rows, cols]
+    X   = (cols - ppx) * Z / fx
+    Y   = (rows - ppy) * Z / fy
     pts = np.stack([X, Y, Z], axis=1)
 
-    # Basic outlier removal
-    z_med  = np.median(pts[:, 2])
-    z_std  = np.std(pts[:, 2])
-    z_mask = np.abs(pts[:, 2] - z_med) < 1.5 * z_std
-    pts    = pts[z_mask]
+    z_med = np.median(pts[:, 2])
+    z_std = np.std(pts[:, 2])
+    pts   = pts[np.abs(pts[:, 2] - z_med) < 1.5 * z_std]
+    print(f"✅ Point cloud: {len(pts):,} points")
 
     # ── Roboflow keypoints ────────────────────────────────────────────────────
     from inference_sdk import InferenceHTTPClient
@@ -201,9 +216,10 @@ def run_pipeline(rgb_path, depth_path, meta_path):
         api_url="https://serverless.roboflow.com",
         api_key="DE2rY8nY3DDIGntoV9pu"
     )
-    cv2.imwrite('/tmp/temp_rgb.jpg', cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
-    rf_result = CLIENT.infer('/tmp/temp_rgb.jpg',
-                              model_id='side-image-key-point-pre-train-km5pt/3')
+    tmp_img = '/tmp/temp_cattle.jpg'
+    cv2.imwrite(tmp_img, cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
+    rf_result = CLIENT.infer(tmp_img, model_id='side-image-key-point-pre-train-km5pt/3')
+    print(f"✅ Roboflow: {len(rf_result['predictions'])} detections")
 
     best_pred    = rf_result['predictions'][0]
     best_overlap = -1
@@ -221,19 +237,17 @@ def run_pipeline(rgb_path, depth_path, meta_path):
     num_kps   = len(keypoints)
     kps_2d    = np.zeros((num_kps, 2), dtype=np.float32)
     kps_conf  = np.zeros(num_kps, dtype=np.float32)
-
     for i, kp in enumerate(keypoints):
         kps_2d[i, 0] = kp['x']
         kps_2d[i, 1] = kp['y']
         kps_conf[i]  = kp['confidence']
 
     # ── Z constraint ─────────────────────────────────────────────────────────
-    kps_3d_pass1 = {}
-    for i in range(num_kps):
-        kps_3d_pass1[i] = snap_to_pointcloud(
-            kps_2d[i,0], kps_2d[i,1], kps_conf[i], pts, fx, fy, ppx, ppy
-        )
-
+    kps_3d_pass1 = {
+        i: snap_to_pointcloud(kps_2d[i,0], kps_2d[i,1], kps_conf[i],
+                              pts, fx, fy, ppx, ppy)
+        for i in range(num_kps)
+    }
     anchor_z = []
     for cid in [1, 9, 2, 8, 13, 3]:
         idx = find_by_class_id(keypoints, cid)
@@ -252,13 +266,12 @@ def run_pipeline(rgb_path, depth_path, meta_path):
         z_max_snap = pts[:, 2].max()
 
     # ── Snap keypoints ────────────────────────────────────────────────────────
-    kps_3d = {}
-    for i in range(num_kps):
-        kps_3d[i] = snap_to_pointcloud(
-            kps_2d[i,0], kps_2d[i,1], kps_conf[i],
-            pts, fx, fy, ppx, ppy,
-            z_min=z_min_snap, z_max=z_max_snap
-        )
+    kps_3d = {
+        i: snap_to_pointcloud(kps_2d[i,0], kps_2d[i,1], kps_conf[i],
+                              pts, fx, fy, ppx, ppy,
+                              z_min=z_min_snap, z_max=z_max_snap)
+        for i in range(num_kps)
+    }
 
     # ── Measurements ──────────────────────────────────────────────────────────
     IDX_PT_SHOULDER = find_by_class_id(keypoints, 2)
@@ -269,93 +282,95 @@ def run_pipeline(rgb_path, depth_path, meta_path):
     IDX_BOB_RIB     = find_by_class_id(keypoints, 8)
     IDX_HOOF_EDGE   = find_by_class_id(keypoints, 12)
 
-    body_length_m    = measure_3d(IDX_PT_SHOULDER, IDX_PIN_BONE, kps_3d)
-    heart_girth_half = measure_3d(IDX_WITHERS, IDX_ELBOW, kps_3d)
-    tinggi_belakang  = measure_3d(IDX_PIN_BONE, IDX_HOOF_EDGE, kps_3d)
-    belly_height_m   = measure_3d(IDX_TOS_RIB, IDX_BOB_RIB, kps_3d)
+    body_length_m    = measure_3d(IDX_PT_SHOULDER, IDX_PIN_BONE,  kps_3d)
+    heart_girth_half = measure_3d(IDX_WITHERS,     IDX_ELBOW,     kps_3d)
+    tinggi_belakang  = measure_3d(IDX_PIN_BONE,    IDX_HOOF_EDGE, kps_3d)
+    belly_height_m   = measure_3d(IDX_TOS_RIB,     IDX_BOB_RIB,   kps_3d)
+    heart_girth_m    = (heart_girth_half * 2) if heart_girth_half else None
 
-    heart_girth_m = (heart_girth_half * 2) if heart_girth_half else None
-
-    # Convert to cm
-    body_length_cm   = body_length_m  * 100 if body_length_m  else None
-    heart_girth_cm   = heart_girth_m  * 100 if heart_girth_m  else None
+    body_length_cm     = body_length_m   * 100 if body_length_m   else None
+    heart_girth_cm     = heart_girth_m   * 100 if heart_girth_m   else None
     tinggi_belakang_cm = tinggi_belakang * 100 if tinggi_belakang else None
-    belly_height_cm  = belly_height_m * 100 if belly_height_m else None
+    belly_height_cm    = belly_height_m  * 100 if belly_height_m  else None
+
+    print(f"Body length:    {body_length_cm:.1f} cm"    if body_length_cm    else "Body length:    ❌")
+    print(f"Heart girth:    {heart_girth_cm:.1f} cm"    if heart_girth_cm    else "Heart girth:    ❌")
+    print(f"Tinggi belakang:{tinggi_belakang_cm:.1f} cm" if tinggi_belakang_cm else "Tinggi belakang:❌")
+    print(f"Belly height:   {belly_height_cm:.1f} cm"   if belly_height_cm   else "Belly height:   ❌")
 
     # ── Schaeffer weight ──────────────────────────────────────────────────────
     schaeffer_weight = None
     if body_length_cm and heart_girth_cm:
         schaeffer_weight = (heart_girth_cm**2 * body_length_cm) / 10841
+        print(f"Schaeffer: {schaeffer_weight:.1f} kg")
 
     # ── RF prediction ─────────────────────────────────────────────────────────
     rf_weight = None
     try:
         rf_model, rf_scaler = get_rf()
         if body_length_m and belly_height_m and tinggi_belakang:
-            X_input = np.array([[
+            X_input  = np.array([[
                 body_length_m,
                 belly_height_m,
                 tinggi_belakang,
                 belly_height_m ** 2
             ]])
-            X_scaled  = rf_scaler.transform(X_input)
+            X_scaled = rf_scaler.transform(X_input)
             rf_weight = float(rf_model.predict(X_scaled)[0])
+            print(f"RF model: {rf_weight:.1f} kg")
     except Exception as e:
         print(f"RF prediction error: {e}")
 
-    # ── Final weight ──────────────────────────────────────────────────────────
     final_weight = rf_weight or schaeffer_weight
 
     return {
-        "status":          "success",
-        "device":          meta.get('deviceModel', 'Unknown'),
+        "status":  "success",
+        "device":  meta.get('deviceModel', 'Unknown'),
         "measurements": {
-            "body_length_cm":     round(body_length_cm,   1) if body_length_cm   else None,
-            "heart_girth_cm":     round(heart_girth_cm,   1) if heart_girth_cm   else None,
-            "tinggi_belakang_cm": round(tinggi_belakang_cm, 1) if tinggi_belakang_cm else None,
-            "belly_height_cm":    round(belly_height_cm,  1) if belly_height_cm  else None,
+            "body_length_cm":      round(body_length_cm,     1) if body_length_cm     else None,
+            "heart_girth_cm":      round(heart_girth_cm,     1) if heart_girth_cm     else None,
+            "tinggi_belakang_cm":  round(tinggi_belakang_cm, 1) if tinggi_belakang_cm else None,
+            "belly_height_cm":     round(belly_height_cm,    1) if belly_height_cm    else None,
         },
         "weight": {
-            "rf_kg":         round(rf_weight,        1) if rf_weight        else None,
-            "schaeffer_kg":  round(schaeffer_weight, 1) if schaeffer_weight else None,
-            "final_kg":      round(final_weight,     1) if final_weight     else None,
+            "rf_kg":        round(rf_weight,        1) if rf_weight        else None,
+            "schaeffer_kg": round(schaeffer_weight, 1) if schaeffer_weight else None,
+            "final_kg":     round(final_weight,     1) if final_weight     else None,
         },
         "depth_quality": meta.get('depthQuality', 'Unknown'),
-        "avg_depth_mm":  meta.get('avgDepthMm',   0),
+        "avg_depth_mm":  meta.get('avgDepthMm', 0),
     }
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# ROUTES
+# ════════════════════════════════════════════════════════════════════════════
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok", "message": "Cattle Weight API running"})
 
 
+# ── Route 1: File upload ──────────────────────────────────────────────────────
 @app.route('/predict', methods=['POST'])
 def predict():
+    """
+    Upload files directly as multipart/form-data.
+    Fields: color, depth, metadata
+    """
     try:
-        # Validate files
-        if 'color' not in request.files:
-            return jsonify({"error": "Missing color.jpg"}), 400
-        if 'depth' not in request.files:
-            return jsonify({"error": "Missing depth.npy"}), 400
-        if 'metadata' not in request.files:
-            return jsonify({"error": "Missing metadata.json"}), 400
+        if 'color'    not in request.files: return jsonify({"error": "Missing color"}),    400
+        if 'depth'    not in request.files: return jsonify({"error": "Missing depth"}),    400
+        if 'metadata' not in request.files: return jsonify({"error": "Missing metadata"}), 400
 
-        color_file    = request.files['color']
-        depth_file    = request.files['depth']
-        metadata_file = request.files['metadata']
-
-        # Save to temp dir
         with tempfile.TemporaryDirectory() as tmpdir:
             rgb_path   = os.path.join(tmpdir, 'color.jpg')
             depth_path = os.path.join(tmpdir, 'depth.npy')
             meta_path  = os.path.join(tmpdir, 'metadata.json')
 
-            color_file.save(rgb_path)
-            depth_file.save(depth_path)
-            metadata_file.save(meta_path)
+            request.files['color'].save(rgb_path)
+            request.files['depth'].save(depth_path)
+            request.files['metadata'].save(meta_path)
 
             result = run_pipeline(rgb_path, depth_path, meta_path)
 
@@ -363,11 +378,9 @@ def predict():
 
     except Exception as e:
         traceback.print_exc()
-        return jsonify({
-            "status": "error",
-            "error":  str(e),
-            "trace":  traceback.format_exc()
-        }), 500
+        return jsonify({"status": "error", "error": str(e),
+                        "trace": traceback.format_exc()}), 500
+
 
 # ── Route 2: Firebase Storage URLs ───────────────────────────────────────────
 @app.route('/predict_url', methods=['POST'])
@@ -380,21 +393,21 @@ def predict_url():
         data = request.get_json()
         if not data:
             return jsonify({"error": "Send JSON body with color_url, depth_url, metadata_url"}), 400
- 
+
         color_url    = data.get('color_url')
         depth_url    = data.get('depth_url')
         metadata_url = data.get('metadata_url')
- 
+
         if not all([color_url, depth_url, metadata_url]):
             return jsonify({"error": "Missing color_url, depth_url or metadata_url"}), 400
- 
+
         print(f"Downloading files from Firebase...")
- 
+
         with tempfile.TemporaryDirectory() as tmpdir:
             rgb_path   = os.path.join(tmpdir, 'color.jpg')
             depth_path = os.path.join(tmpdir, 'depth.npy')
             meta_path  = os.path.join(tmpdir, 'metadata.json')
- 
+
             # Download all 3 files
             download_url(color_url,    rgb_path)
             print(f"✅ color.jpg downloaded")
@@ -402,11 +415,11 @@ def predict_url():
             print(f"✅ depth.npy downloaded")
             download_url(metadata_url, meta_path)
             print(f"✅ metadata.json downloaded")
- 
+
             result = run_pipeline(rgb_path, depth_path, meta_path)
- 
+
         return jsonify(result)
- 
+
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "error": str(e),
@@ -414,7 +427,9 @@ def predict_url():
 
 
 if __name__ == '__main__':
-    print("🐄 Cattle Weight API starting...")
-    print("   POST /predict  — send color.jpg + depth.npy + metadata.json")
-    print("   GET  /health   — check server status")
+    print("🐄 Cattle Weight API")
+    print("   POST /predict      — multipart file upload")
+    print("   POST /predict_url  — Firebase Storage URLs (JSON)")
+    print("   GET  /health       — health check")
+    print()
     app.run(host='0.0.0.0', port=5000, debug=False)

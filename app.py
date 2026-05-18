@@ -11,6 +11,8 @@ Run:
 """
 
 import os, json, tempfile, traceback
+from dotenv import load_dotenv
+load_dotenv()
 import numpy as np
 import cv2
 import torch
@@ -214,7 +216,7 @@ def run_pipeline(rgb_path, depth_path, meta_path):
     from inference_sdk import InferenceHTTPClient
     CLIENT = InferenceHTTPClient(
         api_url="https://serverless.roboflow.com",
-        api_key="DE2rY8nY3DDIGntoV9pu"
+        api_key=os.environ["ROBOFLOW_API_KEY"]
     )
     tmp_img = '/tmp/temp_cattle.jpg'
     cv2.imwrite(tmp_img, cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))

@@ -11,8 +11,6 @@ Run:
 """
 
 import os, json, tempfile, traceback
-from dotenv import load_dotenv
-load_dotenv()
 import numpy as np
 import cv2
 import torch
@@ -32,7 +30,7 @@ def get_yolo():
     global _yolo_model
     if _yolo_model is None:
         from ultralytics import YOLO
-        _yolo_model = YOLO('yolo11n.pt')
+        _yolo_model = YOLO('yolov8n.pt')   # ✅ yolov8 — stable on all versions
     return _yolo_model
 
 def get_sam():
@@ -64,6 +62,19 @@ def get_rf():
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
+
+def download_url(url, dest_path):
+    """Download file from URL — raises clear error on 404/expired token."""
+    r = http_requests.get(url, timeout=60)
+    if r.status_code == 404:
+        raise Exception(
+            f"File not found (404) — Firebase token may have expired.\n"
+            f"URL: {url[:100]}..."
+        )
+    r.raise_for_status()
+    with open(dest_path, 'wb') as f:
+        f.write(r.content)
+    print(f"✅ Downloaded {os.path.basename(dest_path)} ({len(r.content):,} bytes)")
 
 def snap_to_pointcloud(u, v, conf, pts_3d, fx, fy, ppx, ppy,
                         conf_thresh=0.3, search_k=50,
@@ -98,13 +109,6 @@ def measure_3d(idx_a, idx_b, kps_3d):
         return float(np.linalg.norm(pt_a - pt_b))
     return None
 
-def download_url(url, dest_path):
-    """Download file from URL and save to dest_path."""
-    r = http_requests.get(url, timeout=60)
-    r.raise_for_status()
-    with open(dest_path, 'wb') as f:
-        f.write(r.content)
-
 
 # ── Core pipeline ─────────────────────────────────────────────────────────────
 
@@ -117,7 +121,7 @@ def run_pipeline(rgb_path, depth_path, meta_path):
         meta = json.load(f)
 
     h, w = rgb_image.shape[:2]
-    print(f"RGB: {w}×{h}  Depth: {raw_depth.shape}  Device: {meta.get('deviceModel','?')}")
+    print(f"RGB: {w}×{h}  Device: {meta.get('deviceModel','?')}")
 
     # ── YOLO detection ────────────────────────────────────────────────────────
     AI_W, AI_H = 1024, 768
@@ -138,30 +142,16 @@ def run_pipeline(rgb_path, depth_path, meta_path):
         bbox = np.array([0, 0, w, h], dtype=np.float32)
         print("⚠️  No cattle detected — using full image")
     else:
-        print(f"✅ Cattle detected")
+        print("✅ Cattle detected")
 
-    # ── SAM segmentation ─────────────────────────────────────────────────────
-    predictor  = get_sam()
-    predictor.set_image(rgb_small)
-    bbox_small = np.array([
-        bbox[0]/scale_bx, bbox[1]/scale_by,
-        bbox[2]/scale_bx, bbox[3]/scale_by
-    ])
-    masks, scores, _ = predictor.predict(
-        box=bbox_small[None, :], multimask_output=True
-    )
-    best_idx   = 0
-    best_score = 0
-    for i, (mask, score) in enumerate(zip(masks, scores)):
-        cov = np.sum(mask) / mask.size * 100
-        if 8 < cov < 60 and score > best_score:
-            best_score = score
-            best_idx   = i
-    cow_mask = cv2.resize(
-        masks[best_idx].astype(np.uint8), (w, h),
-        interpolation=cv2.INTER_NEAREST
-    )
-    print(f"✅ SAM mask: coverage={np.sum(cow_mask)/cow_mask.size*100:.1f}%")
+    # ── Bbox mask (no SAM — faster, less RAM) ────────────────────────────────
+    cow_mask = np.zeros((h, w), dtype=np.uint8)
+    x1 = max(0, int(bbox[0]))
+    y1 = max(0, int(bbox[1]))
+    x2 = min(w, int(bbox[2]))
+    y2 = min(h, int(bbox[3]))
+    cow_mask[y1:y2, x1:x2] = 1
+    print(f"✅ Bbox mask: {x1},{y1} → {x2},{y2}  coverage={np.sum(cow_mask)/cow_mask.size*100:.1f}%")
 
     # ── Depth refinement ─────────────────────────────────────────────────────
     depth_unit = meta.get('depthUnit', 'mm')
@@ -180,11 +170,8 @@ def run_pipeline(rgb_path, depth_path, meta_path):
         refined   = cv2.ximgproc.jointBilateralFilter(
             joint=rgb_bgr_f, src=depth_up, d=15, sigmaColor=50, sigmaSpace=50
         )
-        print("✅ Joint bilateral filter applied")
     except Exception:
         refined = depth_up.copy()
-        print("⚡ Bilateral filter skipped")
-
     refined[cow_mask == 0] = 0
 
     # ── Intrinsics ────────────────────────────────────────────────────────────
@@ -196,7 +183,6 @@ def run_pipeline(rgb_path, depth_path, meta_path):
     fy  = meta['fy']  * scale_y
     ppx = meta['ppx'] * scale_x
     ppy = meta['ppy'] * scale_y
-    print(f"Intrinsics scaled: fx={fx:.1f} fy={fy:.1f} ppx={ppx:.1f} ppy={ppy:.1f}")
 
     # ── Point cloud ───────────────────────────────────────────────────────────
     depth_m    = refined / 1000.0
@@ -295,10 +281,10 @@ def run_pipeline(rgb_path, depth_path, meta_path):
     tinggi_belakang_cm = tinggi_belakang * 100 if tinggi_belakang else None
     belly_height_cm    = belly_height_m  * 100 if belly_height_m  else None
 
-    print(f"Body length:    {body_length_cm:.1f} cm"    if body_length_cm    else "Body length:    ❌")
-    print(f"Heart girth:    {heart_girth_cm:.1f} cm"    if heart_girth_cm    else "Heart girth:    ❌")
-    print(f"Tinggi belakang:{tinggi_belakang_cm:.1f} cm" if tinggi_belakang_cm else "Tinggi belakang:❌")
-    print(f"Belly height:   {belly_height_cm:.1f} cm"   if belly_height_cm   else "Belly height:   ❌")
+    print(f"Body length:     {body_length_cm:.1f} cm"     if body_length_cm     else "Body length:     ❌")
+    print(f"Heart girth:     {heart_girth_cm:.1f} cm"     if heart_girth_cm     else "Heart girth:     ❌")
+    print(f"Tinggi belakang: {tinggi_belakang_cm:.1f} cm" if tinggi_belakang_cm else "Tinggi belakang: ❌")
+    print(f"Belly height:    {belly_height_cm:.1f} cm"    if belly_height_cm    else "Belly height:    ❌")
 
     # ── Schaeffer weight ──────────────────────────────────────────────────────
     schaeffer_weight = None
@@ -317,7 +303,7 @@ def run_pipeline(rgb_path, depth_path, meta_path):
                 tinggi_belakang,
                 belly_height_m ** 2
             ]])
-            X_scaled = rf_scaler.transform(X_input)
+            X_scaled  = rf_scaler.transform(X_input)
             rf_weight = float(rf_model.predict(X_scaled)[0])
             print(f"RF model: {rf_weight:.1f} kg")
     except Exception as e:
@@ -356,10 +342,7 @@ def health():
 # ── Route 1: File upload ──────────────────────────────────────────────────────
 @app.route('/predict', methods=['POST'])
 def predict():
-    """
-    Upload files directly as multipart/form-data.
-    Fields: color, depth, metadata
-    """
+    """Upload files as multipart/form-data. Fields: color, depth, metadata"""
     try:
         if 'color'    not in request.files: return jsonify({"error": "Missing color"}),    400
         if 'depth'    not in request.files: return jsonify({"error": "Missing depth"}),    400
@@ -387,10 +370,7 @@ def predict():
 # ── Route 2: Firebase Storage URLs ───────────────────────────────────────────
 @app.route('/predict_url', methods=['POST'])
 def predict_url():
-    """
-    Send Firebase Storage download URLs as JSON.
-    Body: { "color_url": "...", "depth_url": "...", "metadata_url": "..." }
-    """
+    """Send Firebase Storage URLs as JSON body."""
     try:
         data = request.get_json()
         if not data:
@@ -403,20 +383,16 @@ def predict_url():
         if not all([color_url, depth_url, metadata_url]):
             return jsonify({"error": "Missing color_url, depth_url or metadata_url"}), 400
 
-        print(f"Downloading files from Firebase...")
+        print("Downloading files from Firebase...")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             rgb_path   = os.path.join(tmpdir, 'color.jpg')
             depth_path = os.path.join(tmpdir, 'depth.npy')
             meta_path  = os.path.join(tmpdir, 'metadata.json')
 
-            # Download all 3 files
             download_url(color_url,    rgb_path)
-            print(f"✅ color.jpg downloaded")
             download_url(depth_url,    depth_path)
-            print(f"✅ depth.npy downloaded")
             download_url(metadata_url, meta_path)
-            print(f"✅ metadata.json downloaded")
 
             result = run_pipeline(rgb_path, depth_path, meta_path)
 
@@ -433,5 +409,4 @@ if __name__ == '__main__':
     print("   POST /predict      — multipart file upload")
     print("   POST /predict_url  — Firebase Storage URLs (JSON)")
     print("   GET  /health       — health check")
-    print()
     app.run(host='0.0.0.0', port=5000, debug=False)
